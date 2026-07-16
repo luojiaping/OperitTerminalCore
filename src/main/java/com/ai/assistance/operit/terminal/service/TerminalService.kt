@@ -49,7 +49,9 @@ class TerminalService : Service() {
         }
 
         override fun closeSession(sessionId: String) {
-            terminalManager.closeSession(sessionId)
+            runBlocking {
+                terminalManager.closeSessionAndWait(sessionId)
+            }
         }
 
         override fun sendCommand(command: String): String {
@@ -133,4 +135,4 @@ class TerminalService : Service() {
         }
         callbacks.finishBroadcast()
     }
-} 
+}

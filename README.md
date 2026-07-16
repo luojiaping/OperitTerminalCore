@@ -27,4 +27,25 @@ The `terminal-core` module is responsible for the following core tasks:
 
 ## Usage
 
-This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface. 
+This module can be integrated as a Git Submodule. The client application can either bind to the `TerminalService` for background operation and IPC, or directly access the `TerminalManager` singleton if running in the same process. Refer to the main project's `README.md` for a detailed example of the AIDL interface.
+
+### Session-scoped shell commands
+
+Direct `TerminalManager` clients can create a session that is not shown as a terminal tab and execute isolated shell commands in that exact session:
+
+```kotlin
+val session = terminalManager.createNewSession(
+    title = "Tool execution",
+    presentation = SessionPresentation.BACKGROUND
+)
+val commandId = terminalManager.sendShellCommandToSession(
+    sessionId = session.id,
+    command = command
+)
+```
+
+Observe `commandExecutionEvents` by both `sessionId` and `commandId`. A completed shell command includes its real `exitCode`. Cancellation code can call `cancelCommand(sessionId, commandId)` from a non-cancellable flow cleanup path. Queued commands are removed without interrupting the active command; an active command receives Ctrl+C only when both identifiers match.
+
+Call `closeSessionAndWait(sessionId)` when session ownership must be released deterministically. A successful return means the provider session and PTY have been closed and the read job has finished. `TerminalService.closeSession` uses this waiting path. `TerminalManager.closeSession(sessionId)` is the non-blocking UI wrapper: it schedules the same close operation and returns before completion.
+
+`sendCommand` and `sendCommandToSession` remain raw terminal-input APIs. They do not use the isolated `sh -c` execution protocol and do not report a shell exit code.

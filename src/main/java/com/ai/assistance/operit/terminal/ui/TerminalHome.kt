@@ -46,6 +46,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.ai.assistance.operit.terminal.data.CommandHistoryItem
+import com.ai.assistance.operit.terminal.data.SessionPresentation
 import com.ai.assistance.operit.terminal.view.canvas.CanvasTerminalOutput
 import com.ai.assistance.operit.terminal.view.canvas.CanvasTerminalScreen
 import com.ai.assistance.operit.terminal.view.canvas.RenderConfig
@@ -278,8 +279,9 @@ fun TerminalHome(
         env.sessions.find { it.id == env.currentSessionId }?.pty
     }
     val tabItems = remember(env.sessions) {
-        val closable = env.sessions.size > 1
-        env.sessions.map { session ->
+        val tabSessions = env.sessions.filter { it.presentation == SessionPresentation.TAB }
+        val closable = tabSessions.size > 1
+        tabSessions.map { session ->
             TerminalTabRenderItem(
                 id = session.id,
                 title = session.title,
@@ -288,7 +290,7 @@ fun TerminalHome(
         }
     }
     val onTabCloseRequest: (String) -> Unit = { sessionId ->
-        if (env.sessions.size > 1) {
+        if (tabItems.size > 1) {
             sessionToDelete = sessionId
             showDeleteConfirmDialog = true
         }

@@ -13,11 +13,29 @@ import java.io.OutputStreamWriter
 import java.util.UUID
 
 /**
+ * 命令在终端会话中的执行方式。
+ */
+enum class CommandExecutionMode {
+    RAW,
+    SHELL
+}
+
+/**
+ * 会话的展示方式。
+ */
+enum class SessionPresentation {
+    TAB,
+    BACKGROUND
+}
+
+/**
  * 队列中的命令项
  */
 data class QueuedCommand(
     val id: String,
-    val command: String
+    val command: String,
+    val executionMode: CommandExecutionMode = CommandExecutionMode.RAW,
+    val executionToken: String = ""
 )
 
 /**
@@ -28,7 +46,9 @@ class CommandHistoryItem(
     prompt: String,
     command: String,
     output: String,
-    isExecuting: Boolean = false
+    isExecuting: Boolean = false,
+    val executionMode: CommandExecutionMode = CommandExecutionMode.RAW,
+    val executionToken: String = ""
 ) {
     private var _prompt by mutableStateOf(prompt)
     private var _command by mutableStateOf(command)
@@ -36,6 +56,9 @@ class CommandHistoryItem(
     private var _isExecuting by mutableStateOf(isExecuting)
     
     val outputPages = mutableStateListOf<String>()
+    @Transient var hasReceivedShellBegin: Boolean = false
+    @Transient var hasConsumedShellBeginDelimiter: Boolean = false
+    @Transient val shellProtocolBuffer: StringBuilder = StringBuilder()
     
     // 为AIDL序列化提供稳定的getter
     val prompt: String get() = _prompt
@@ -48,6 +71,13 @@ class CommandHistoryItem(
     fun setCommand(value: String) { _command = value }
     fun setOutput(value: String) { _output = value }
     fun setExecuting(value: Boolean) { _isExecuting = value }
+
+    @Synchronized
+    fun tryMarkCompleted(): Boolean {
+        if (!_isExecuting) return false
+        _isExecuting = false
+        return true
+    }
 
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -101,7 +131,8 @@ data class TerminalSessionData(
     @Transient val commandQueue: MutableList<QueuedCommand> = mutableListOf(),
     @Transient val commandMutex: Mutex = Mutex(),
     // 保存每个会话的滚动位置
-    var scrollOffsetY: Float = 0f
+    var scrollOffsetY: Float = 0f,
+    val presentation: SessionPresentation = SessionPresentation.TAB
 ) {
     val isInitializing: Boolean
         get() = initState != SessionInitState.READY
@@ -150,4 +181,4 @@ data class SourceConfig(
     val packageManager: PackageManagerType,
     val selectedSourceId: String,
     val sources: List<MirrorSource>
-) 
+)

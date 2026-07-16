@@ -4,6 +4,9 @@ import android.util.Log
 import com.ai.assistance.operit.terminal.CommandExecutionEvent
 import com.ai.assistance.operit.terminal.SessionDirectoryEvent
 import com.ai.assistance.operit.terminal.SessionManager
+import com.ai.assistance.operit.terminal.ShellCommandProtocol
+import com.ai.assistance.operit.terminal.data.CommandExecutionMode
+import com.ai.assistance.operit.terminal.data.CommandHistoryItem
 import com.ai.assistance.operit.terminal.data.SessionInitState
 import com.ai.assistance.operit.terminal.data.TerminalSessionData
 import com.ai.assistance.operit.terminal.view.domain.ansi.AnsiUtils
@@ -45,6 +48,12 @@ class OutputProcessor(
         sessionManager: SessionManager
     ) {
         val session = sessionManager.getSession(sessionId) ?: return
+        val currentCommand = session.currentExecutingCommand
+        if (currentCommand?.executionMode == CommandExecutionMode.SHELL && currentCommand.isExecuting) {
+            processShellOutput(sessionId, chunk, currentCommand, sessionManager)
+            return
+        }
+
         session.rawBuffer.append(chunk)
 
         if (session.rawBuffer.length > MAX_RAW_BUFFER_CHARS) {
@@ -150,6 +159,166 @@ class OutputProcessor(
      */
     fun clearSessionState(sessionId: String) {
         sessionStates.remove(sessionId)
+    }
+
+    private fun processShellOutput(
+        sessionId: String,
+        chunk: String,
+        command: CommandHistoryItem,
+        sessionManager: SessionManager
+    ) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        if (session.currentExecutingCommand !== command || !command.isExecuting) return
+
+        val protocolBuffer = command.shellProtocolBuffer
+        protocolBuffer.append(chunk)
+        val beginMarker = ShellCommandProtocol.beginMarker(command.executionToken)
+
+        if (!command.hasReceivedShellBegin) {
+            val beginIndex = protocolBuffer.indexOf(beginMarker)
+            if (beginIndex < 0) {
+                retainMarkerTail(protocolBuffer, beginMarker.length)
+                return
+            }
+
+            protocolBuffer.delete(0, beginIndex + beginMarker.length)
+            command.hasReceivedShellBegin = true
+        }
+
+        if (!command.hasConsumedShellBeginDelimiter) {
+            if (!consumeLeadingLineBreak(protocolBuffer)) return
+            command.hasConsumedShellBeginDelimiter = true
+        }
+
+        val endMarkerPrefix = ShellCommandProtocol.endMarkerPrefix(command.executionToken)
+        val endIndex = protocolBuffer.indexOf(endMarkerPrefix)
+        if (endIndex >= 0) {
+            val exitCodeStart = endIndex + endMarkerPrefix.length
+            val markerEnd = protocolBuffer.indexOf(
+                ShellCommandProtocol.markerSuffix(),
+                exitCodeStart
+            )
+            if (markerEnd < 0) {
+                if (endIndex > 0) {
+                    processShellPayload(
+                        sessionId,
+                        removeProtocolDelimiter(protocolBuffer.substring(0, endIndex)),
+                        sessionManager
+                    )
+                    protocolBuffer.delete(0, endIndex)
+                }
+                return
+            }
+
+            processShellPayload(
+                sessionId,
+                removeProtocolDelimiter(protocolBuffer.substring(0, endIndex)),
+                sessionManager
+            )
+            val exitCodeText = protocolBuffer.substring(exitCodeStart, markerEnd)
+            val exitCode = exitCodeText.toIntOrNull()
+            protocolBuffer.clear()
+            flushShellPayload(sessionId, sessionManager)
+
+            if (exitCode == null) {
+                Log.e(
+                    TAG,
+                    "Invalid shell execution exit code for command ${command.id}: $exitCodeText"
+                )
+                finishCurrentCommand(sessionId, sessionManager, -1)
+            } else {
+                finishCurrentCommand(sessionId, sessionManager, exitCode)
+            }
+            return
+        }
+
+        val retainedLength = endMarkerPrefix.length + 2
+        val safePayloadLength = protocolBuffer.length - retainedLength
+        if (safePayloadLength > 0) {
+            val payload = protocolBuffer.substring(0, safePayloadLength)
+            protocolBuffer.delete(0, safePayloadLength)
+            processShellPayload(sessionId, payload, sessionManager)
+        }
+    }
+
+    private fun retainMarkerTail(buffer: StringBuilder, markerLength: Int) {
+        val retainedLength = (markerLength - 1).coerceAtLeast(0)
+        if (buffer.length > retainedLength) {
+            buffer.delete(0, buffer.length - retainedLength)
+        }
+    }
+
+    private fun consumeLeadingLineBreak(buffer: StringBuilder): Boolean {
+        if (buffer.isEmpty()) return false
+        if (buffer.length == 1 && buffer[0] == '\r') return false
+        when {
+            buffer.startsWith("\r\n") -> buffer.delete(0, 2)
+            buffer.startsWith("\r") || buffer.startsWith("\n") -> buffer.deleteCharAt(0)
+        }
+        return true
+    }
+
+    private fun removeProtocolDelimiter(payload: String): String {
+        return when {
+            payload.endsWith("\r\n") -> payload.dropLast(2)
+            payload.endsWith("\r") || payload.endsWith("\n") -> payload.dropLast(1)
+            else -> payload
+        }
+    }
+
+    private fun processShellPayload(
+        sessionId: String,
+        payload: String,
+        sessionManager: SessionManager
+    ) {
+        if (payload.isEmpty()) return
+        val session = sessionManager.getSession(sessionId) ?: return
+        session.ansiParser.parse(payload)
+        session.rawBuffer.append(payload)
+
+        if (session.rawBuffer.length > MAX_RAW_BUFFER_CHARS) {
+            val over = session.rawBuffer.length - MAX_RAW_BUFFER_CHARS
+            session.rawBuffer.delete(0, over)
+        }
+
+        while (session.rawBuffer.isNotEmpty()) {
+            val bufferContent = session.rawBuffer.toString()
+            val newlineIndex = bufferContent.indexOf('\n')
+            val carriageReturnIndex = bufferContent.indexOf('\r')
+
+            if (carriageReturnIndex >= 0 &&
+                (newlineIndex < 0 || carriageReturnIndex < newlineIndex)) {
+                val line = bufferContent.substring(0, carriageReturnIndex)
+                val isCrLf =
+                    carriageReturnIndex + 1 < bufferContent.length &&
+                        bufferContent[carriageReturnIndex + 1] == '\n'
+                val consumedLength = if (isCrLf) carriageReturnIndex + 2 else carriageReturnIndex + 1
+                session.rawBuffer.delete(0, consumedLength)
+                val cleanLine = AnsiUtils.stripAnsi(line)
+                if (isCrLf) {
+                    updateCommandOutput(sessionId, cleanLine, sessionManager)
+                } else if (cleanLine.isNotEmpty()) {
+                    updateProgressOutput(sessionId, cleanLine, sessionManager)
+                }
+            } else if (newlineIndex >= 0) {
+                val line = bufferContent.substring(0, newlineIndex)
+                session.rawBuffer.delete(0, newlineIndex + 1)
+                updateCommandOutput(sessionId, AnsiUtils.stripAnsi(line), sessionManager)
+            } else {
+                break
+            }
+        }
+    }
+
+    private fun flushShellPayload(sessionId: String, sessionManager: SessionManager) {
+        val session = sessionManager.getSession(sessionId) ?: return
+        if (session.rawBuffer.isEmpty()) return
+
+        val cleanLine = AnsiUtils.stripAnsi(session.rawBuffer.toString())
+        session.rawBuffer.clear()
+        if (cleanLine.isNotEmpty()) {
+            updateCommandOutput(sessionId, cleanLine, sessionManager)
+        }
     }
 
     private fun handleCarriageReturn(sessionId: String, line: String, sessionManager: SessionManager) {
@@ -541,7 +710,11 @@ class OutputProcessor(
         }
     }
 
-    private fun finishCurrentCommand(sessionId: String, sessionManager: SessionManager) {
+    private fun finishCurrentCommand(
+        sessionId: String,
+        sessionManager: SessionManager,
+        exitCode: Int? = null
+    ) {
         sessionManager.updateSession(sessionId) { session ->
             session.copy(
                 isWaitingForInteractiveInput = false,
@@ -554,7 +727,7 @@ class OutputProcessor(
         val session = sessionManager.getSession(sessionId) ?: return
         val lastExecutingItem = session.currentExecutingCommand
 
-        if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
+        if (lastExecutingItem != null && lastExecutingItem.tryMarkCompleted()) {
             val finalOutput = buildString {
                 if (lastExecutingItem.outputPages.isNotEmpty()) {
                     append(lastExecutingItem.outputPages.joinToString("\n"))
@@ -567,7 +740,6 @@ class OutputProcessor(
             }.trim()
 
             lastExecutingItem.setOutput(finalOutput)
-            lastExecutingItem.setExecuting(false)
 
             Log.i(TAG, "Finishing command ${lastExecutingItem.id} for session $sessionId")
             
@@ -576,7 +748,8 @@ class OutputProcessor(
                 commandId = lastExecutingItem.id,
                 sessionId = sessionId,
                 outputChunk = finalOutput,
-                isCompleted = true
+                isCompleted = true,
+                exitCode = exitCode
             ))
 
             // Clear the reference since command is no longer executing
@@ -607,7 +780,7 @@ class OutputProcessor(
         session.ansiParser.parse("\r\n$message\r\n")
 
         val lastExecutingItem = session.currentExecutingCommand
-        if (lastExecutingItem != null && lastExecutingItem.isExecuting) {
+        if (lastExecutingItem != null && lastExecutingItem.tryMarkCompleted()) {
             val builder = session.currentCommandOutput
             if (builder.isNotEmpty() && builder.last() != '\n') {
                 builder.append('\n')
@@ -626,23 +799,35 @@ class OutputProcessor(
             }.trim()
 
             lastExecutingItem.setOutput(finalOutput)
-            lastExecutingItem.setExecuting(false)
 
             onCommandExecutionEvent(
                 CommandExecutionEvent(
                     commandId = lastExecutingItem.id,
                     sessionId = sessionId,
                     outputChunk = finalOutput,
-                    isCompleted = true
+                    isCompleted = true,
+                    exitCode = -1
                 )
             )
-
-            session.currentExecutingCommand = null
+            lastExecutingItem.shellProtocolBuffer.clear()
         }
+        session.currentExecutingCommand = null
 
         session.currentCommandOutput.clear()
         session.currentOutputLineCount = 0
+        val queuedCommands = session.commandQueue.toList()
         session.commandQueue.clear()
+        queuedCommands.forEach { command ->
+            onCommandExecutionEvent(
+                CommandExecutionEvent(
+                    commandId = command.id,
+                    sessionId = sessionId,
+                    outputChunk = "",
+                    isCompleted = true,
+                    exitCode = -1
+                )
+            )
+        }
     }
 
     /**

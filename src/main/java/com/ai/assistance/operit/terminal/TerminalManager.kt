@@ -2,7 +2,11 @@ package com.ai.assistance.operit.terminal
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
@@ -16,9 +20,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.map
+import com.ai.assistance.operit.terminal.data.CommandExecutionMode
 import com.ai.assistance.operit.terminal.data.TerminalState
 import com.ai.assistance.operit.terminal.data.CommandHistoryItem
 import com.ai.assistance.operit.terminal.data.QueuedCommand
+import com.ai.assistance.operit.terminal.data.SessionPresentation
 import com.ai.assistance.operit.terminal.view.domain.OutputProcessor
 import java.util.UUID
 import kotlinx.coroutines.SupervisorJob
@@ -36,7 +42,6 @@ import com.ai.assistance.operit.terminal.provider.filesystem.FileSystemProvider
 import com.ai.assistance.operit.terminal.provider.filesystem.LocalFileSystemProvider
 import com.ai.assistance.operit.terminal.provider.filesystem.PRootBindMount
 import com.ai.assistance.operit.terminal.provider.filesystem.PRootMountMapping
-import com.ai.assistance.operit.terminal.provider.type.HiddenExecResult
 import com.ai.assistance.operit.terminal.provider.type.TerminalProvider
 import com.ai.assistance.operit.terminal.provider.type.TerminalType
 import com.ai.assistance.operit.terminal.provider.type.LocalTerminalProvider
@@ -55,14 +60,15 @@ class TerminalManager private constructor(
     private val usrDir: File = File(filesDir, "usr")
     private val binDir: File = File(usrDir, "bin")
     private val nativeLibDir: String = context.applicationInfo.nativeLibraryDir
-    private val activeSessions = ConcurrentHashMap<String, TerminalSession>()
     private val closingSessions = ConcurrentHashMap.newKeySet<String>()
+    private val sessionStartJobs = ConcurrentHashMap<String, Job>()
+    private val sessionLifecycleMutex = Mutex()
     
     // SharedPreferences for reading settings
     private val prefs = context.getSharedPreferences("terminal_settings", Context.MODE_PRIVATE)
 
     // 核心组件
-    private val sessionManager = SessionManager(this)
+    private val sessionManager = SessionManager()
     private val outputProcessor = OutputProcessor(
         onCommandExecutionEvent = { event ->
             coroutineScope.launch {
@@ -151,9 +157,11 @@ class TerminalManager private constructor(
      * 自动检测终端类型：如果配置了SSH则使用SSH，否则使用本地终端
      * 
      * @param title 会话标题
+     * @param presentation 会话是否展示为终端标签页
      */
     suspend fun createNewSession(
-        title: String? = null
+        title: String? = null,
+        presentation: SessionPresentation = SessionPresentation.TAB
     ): TerminalSessionData {
         // 自动检测终端类型
         val terminalType = if (sshConfigManager.getConfig() != null && sshConfigManager.isEnabled()) {
@@ -162,12 +170,12 @@ class TerminalManager private constructor(
             TerminalType.LOCAL
         }
         
-        val newSession = sessionManager.createNewSession(title, terminalType)
-
-        // 异步初始化会话
-        coroutineScope.launch {
-            initializeSession(newSession.id)
-        }
+        val newSession =
+            sessionLifecycleMutex.withLock {
+                sessionManager.createNewSession(title, terminalType, presentation).also { session ->
+                    initializeSession(session.id)
+                }
+            }
 
         // 等待会话初始化完成
         val success = withTimeoutOrNull(30000) { // 30秒超时
@@ -180,7 +188,7 @@ class TerminalManager private constructor(
         if (success == null) {
             Log.e(TAG, "Session initialization timeout for session: ${newSession.id}")
             // 初始化失败，移除会话
-            sessionManager.closeSession(newSession.id)
+            closeSessionAndWait(newSession.id)
             throw Exception("Session initialization timeout")
         }
 
@@ -196,17 +204,127 @@ class TerminalManager private constructor(
     }
 
     /**
-     * 关闭会话
+     * 为 UI 和同步接口调度会话关闭。需要确认关闭完成的调用方应使用 closeSessionAndWait。
      */
     fun closeSession(sessionId: String) {
-        sessionManager.closeSession(sessionId)
+        coroutineScope.launch {
+            try {
+                closeSessionAndWait(sessionId)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to close terminal session $sessionId", e)
+            }
+        }
     }
 
     /**
-     * 会话关闭后的运行态清理（非持久化状态）。
+     * 关闭指定会话并等待 provider、PTY 和读取协程全部结束。
      */
-    fun onSessionClosed(sessionId: String) {
-        outputProcessor.clearSessionState(sessionId)
+    suspend fun closeSessionAndWait(sessionId: String): Boolean =
+        withContext(Dispatchers.IO + NonCancellable) {
+            val closeTarget =
+                sessionLifecycleMutex.withLock {
+                    closingSessions.add(sessionId)
+                    val session = sessionManager.detachSession(sessionId)
+                    if (session == null) {
+                        closingSessions.remove(sessionId)
+                        null
+                    } else {
+                        session to sessionStartJobs[sessionId]
+                    }
+                } ?: return@withContext false
+            val (session, startJob) = closeTarget
+
+            val events = session.commandMutex.withLock {
+                drainSessionCommands(session)
+            }
+
+            startJob?.join()
+
+            var closeFailure: Throwable? = null
+            fun recordFailure(step: String, error: Throwable) {
+                Log.e(TAG, "Failed to close $step for session $sessionId", error)
+                val firstFailure = closeFailure
+                if (firstFailure == null) {
+                    closeFailure = error
+                } else {
+                    firstFailure.addSuppressed(error)
+                }
+            }
+
+            try {
+                session.sessionWriter?.close()
+            } catch (e: Exception) {
+                recordFailure("session writer", e)
+            }
+
+            try {
+                terminalProvider?.closeSession(sessionId)
+            } catch (e: Exception) {
+                recordFailure("terminal provider", e)
+            }
+
+            try {
+                session.pty?.destroy()
+            } catch (e: Exception) {
+                recordFailure("PTY", e)
+            }
+
+            try {
+                session.readJob?.cancelAndJoin()
+            } catch (e: Exception) {
+                recordFailure("terminal read job", e)
+            }
+
+            outputProcessor.clearSessionState(sessionId)
+            closingSessions.remove(sessionId)
+            events.forEach { event -> _commandExecutionEvents.emit(event) }
+
+            closeFailure?.let { throw it }
+            Log.d(TAG, "Closed terminal session and resources: $sessionId")
+            true
+        }
+
+    private fun drainSessionCommands(session: TerminalSessionData): List<CommandExecutionEvent> {
+        val events = mutableListOf<CommandExecutionEvent>()
+        session.currentExecutingCommand?.let { command ->
+            if (command.tryMarkCompleted()) {
+                events.add(
+                    CommandExecutionEvent(
+                        commandId = command.id,
+                        sessionId = session.id,
+                        outputChunk = command.output,
+                        isCompleted = true,
+                        exitCode = -1
+                    )
+                )
+            }
+            command.shellProtocolBuffer.clear()
+        }
+        session.currentExecutingCommand = null
+        session.currentCommandOutput.clear()
+        session.rawBuffer.clear()
+        session.currentOutputLineCount = 0
+
+        session.commandQueue.forEach { command ->
+            events.add(
+                CommandExecutionEvent(
+                    commandId = command.id,
+                    sessionId = session.id,
+                    outputChunk = "",
+                    isCompleted = true,
+                    exitCode = -1
+                )
+            )
+        }
+        session.commandQueue.clear()
+        return events
+    }
+
+    private fun emitCommandEvents(events: List<CommandExecutionEvent>) {
+        if (events.isEmpty()) return
+        coroutineScope.launch {
+            events.forEach { event -> _commandExecutionEvents.emit(event) }
+        }
     }
     
     /**
@@ -249,14 +367,24 @@ class TerminalManager private constructor(
         }
     }
 
-    private fun writeInputToKernel(session: TerminalSessionData, input: String, source: String) {
-        val writer = session.sessionWriter ?: return
+    private fun writeInputToKernel(
+        session: TerminalSessionData,
+        input: String,
+        source: String,
+        includeInputInLog: Boolean = true
+    ): Boolean {
+        val writer = session.sessionWriter ?: return false
         writer.write(input)
         writer.flush()
-        Log.d(
-            TAG,
-            "Sent terminal input to kernel [source=$source, sessionId=${session.id}]: '${escapeInputForLog(input)}'"
-        )
+        if (includeInputInLog) {
+            Log.d(
+                TAG,
+                "Sent terminal input to kernel [source=$source, sessionId=${session.id}]: '${escapeInputForLog(input)}'"
+            )
+        } else {
+            Log.d(TAG, "Sent terminal input to kernel [source=$source, sessionId=${session.id}]")
+        }
+        return true
     }
 
     private fun escapeInputForLog(input: String): String {
@@ -341,12 +469,116 @@ class TerminalManager private constructor(
     }
 
     /**
+     * 在指定会话中通过独立的 sh -c 调用执行命令，不改变当前会话。
+     */
+    suspend fun sendShellCommandToSession(
+        sessionId: String,
+        command: String,
+        commandId: String? = null
+    ): String {
+        val session = requireNotNull(sessionManager.getSession(sessionId)) {
+            "Terminal session not found: $sessionId"
+        }
+        check(session.initState == SessionInitState.READY) {
+            "Terminal session is not ready: $sessionId"
+        }
+        check(!session.isInteractiveMode) {
+            "Terminal session is waiting for interactive input: $sessionId"
+        }
+
+        val actualCommandId = commandId ?: UUID.randomUUID().toString()
+        val executionToken = ShellCommandProtocol.newExecutionToken()
+        val queuedCommand =
+            QueuedCommand(
+                id = actualCommandId,
+                command = command,
+                executionMode = CommandExecutionMode.SHELL,
+                executionToken = executionToken
+            )
+
+        session.commandMutex.withLock {
+            check(!closingSessions.contains(sessionId)) {
+                "Terminal session is closing: $sessionId"
+            }
+            check(
+                session.currentExecutingCommand?.id != actualCommandId &&
+                    session.commandQueue.none { it.id == actualCommandId }
+            ) {
+                "Command ID is already in use for session $sessionId: $actualCommandId"
+            }
+
+            if (session.currentExecutingCommand?.isExecuting == true) {
+                session.commandQueue.add(queuedCommand)
+                Log.d(
+                    TAG,
+                    "Shell command queued for session $sessionId: id=$actualCommandId queueSize=${session.commandQueue.size}"
+                )
+            } else {
+                executeCommandInternal(
+                    command = command,
+                    session = session,
+                    commandId = actualCommandId,
+                    executionMode = CommandExecutionMode.SHELL,
+                    executionToken = executionToken
+                )
+            }
+        }
+        return actualCommandId
+    }
+
+    /**
+     * 仅取消指定会话中 ID 完全匹配的命令。
+     */
+    suspend fun cancelCommand(sessionId: String, commandId: String): Boolean =
+        withContext(Dispatchers.IO + NonCancellable) {
+            val session = sessionManager.getSession(sessionId) ?: return@withContext false
+            var removedQueuedCommand: QueuedCommand? = null
+            var interruptedCurrentCommand = false
+
+            session.commandMutex.withLock {
+                val queuedIndex = session.commandQueue.indexOfFirst { it.id == commandId }
+                if (queuedIndex >= 0) {
+                    removedQueuedCommand = session.commandQueue.removeAt(queuedIndex)
+                    return@withLock
+                }
+
+                val currentCommand = session.currentExecutingCommand
+                if (currentCommand?.id == commandId && currentCommand.isExecuting) {
+                    try {
+                        // The token end marker owns completion and queue advancement after SIGINT.
+                        interruptedCurrentCommand =
+                            writeInputToKernel(session, "\u0003", "command-cancel")
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error cancelling command $commandId in session $sessionId", e)
+                    }
+                }
+            }
+
+            removedQueuedCommand?.let {
+                _commandExecutionEvents.emit(
+                    CommandExecutionEvent(
+                        commandId = commandId,
+                        sessionId = sessionId,
+                        outputChunk = "",
+                        isCompleted = true,
+                        exitCode = 130
+                    )
+                )
+                Log.d(TAG, "Removed queued command $commandId from session $sessionId")
+                return@withContext true
+            }
+
+            interruptedCurrentCommand
+        }
+
+    /**
      * 处理队列中的下一个命令
      */
     private suspend fun processNextQueuedCommand(sessionId: String) {
         val session = sessionManager.getSession(sessionId) ?: return
 
         session.commandMutex.withLock {
+            if (closingSessions.contains(sessionId)) return@withLock
             if (session.currentExecutingCommand?.isExecuting == true) {
                 Log.w(TAG, "processNextQueuedCommand called, but a command is still executing. This should not happen.")
                 return@withLock
@@ -355,7 +587,13 @@ class TerminalManager private constructor(
             if (session.commandQueue.isNotEmpty()) {
                 val nextCommand = session.commandQueue.removeAt(0)
                 Log.d(TAG, "Processing next queued command: ${nextCommand.command} (id: ${nextCommand.id}). Queue size: ${session.commandQueue.size}")
-                executeCommandInternal(nextCommand.command, session, nextCommand.id)
+                executeCommandInternal(
+                    command = nextCommand.command,
+                    session = session,
+                    commandId = nextCommand.id,
+                    executionMode = nextCommand.executionMode,
+                    executionToken = nextCommand.executionToken
+                )
             }
         }
     }
@@ -363,8 +601,39 @@ class TerminalManager private constructor(
     /**
      * 内部执行命令的函数, 必须在 commandMutex 锁内部调用
      */
-    private suspend fun executeCommandInternal(command: String, session: TerminalSessionData, commandId: String) {
-        if (command.trim() == "clear") {
+    private suspend fun executeCommandInternal(
+        command: String,
+        session: TerminalSessionData,
+        commandId: String,
+        executionMode: CommandExecutionMode = CommandExecutionMode.RAW,
+        executionToken: String = ""
+    ) {
+        if (executionMode == CommandExecutionMode.SHELL) {
+            handleRegularCommand(
+                command = command,
+                session = session,
+                commandId = commandId,
+                executionMode = executionMode,
+                executionToken = executionToken
+            )
+            try {
+                val wrappedCommand = ShellCommandProtocol.wrap(command, executionToken)
+                check(
+                    writeInputToKernel(
+                        session,
+                        wrappedCommand + TERMINAL_ENTER,
+                        "shell-command",
+                        includeInputInLog = false
+                    )
+                ) {
+                    "Terminal session writer is unavailable: ${session.id}"
+                }
+                Log.d(TAG, "Sent shell command to PTY: sessionId=${session.id} commandId=$commandId")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error sending shell command $commandId to session ${session.id}", e)
+                failStartedCommand(session, commandId, e.toString())
+            }
+        } else if (command.trim() == "clear") {
             try {
                 writeInputToKernel(session, "clear$TERMINAL_ENTER", "command-clear")
             } catch (e: Exception) {
@@ -379,6 +648,35 @@ class TerminalManager private constructor(
             } catch (e: Exception) {
                 Log.e(TAG, "Error sending command", e)
             }
+        }
+    }
+
+    private fun failStartedCommand(
+        session: TerminalSessionData,
+        commandId: String,
+        message: String
+    ) {
+        val currentCommand = session.currentExecutingCommand
+        if (currentCommand?.id != commandId || !currentCommand.tryMarkCompleted()) return
+
+        currentCommand.setOutput(message)
+        currentCommand.shellProtocolBuffer.clear()
+        session.currentExecutingCommand = null
+        session.currentCommandOutput.clear()
+        session.currentOutputLineCount = 0
+        emitCommandEvents(
+            listOf(
+                CommandExecutionEvent(
+                    commandId = commandId,
+                    sessionId = session.id,
+                    outputChunk = message,
+                    isCompleted = true,
+                    exitCode = -1
+                )
+            )
+        )
+        coroutineScope.launch {
+            processNextQueuedCommand(session.id)
         }
     }
 
@@ -422,30 +720,38 @@ class TerminalManager private constructor(
     }
 
     private fun initializeSession(sessionId: String) {
-        coroutineScope.launch {
+        val startJob = coroutineScope.launch(start = CoroutineStart.LAZY) {
             val success = initializeEnvironment()
             if (success) {
                 startSession(sessionId)
             }
         }
+        sessionStartJobs[sessionId] = startJob
+        startJob.invokeOnCompletion {
+            sessionStartJobs.remove(sessionId, startJob)
+        }
+        startJob.start()
     }
 
-    private fun startSession(sessionId: String) {
-        coroutineScope.launch(Dispatchers.IO) {
-            try {
-                Log.d(TAG, "Starting session...")
-                closingSessions.remove(sessionId)
+    private suspend fun startSession(sessionId: String) = withContext(Dispatchers.IO) {
+        var provider: TerminalProvider? = null
+        var pty: Pty? = null
+        var sessionWriter: java.io.OutputStreamWriter? = null
+        var readJob: Job? = null
+        var attachedToState = false
 
-                // 获取单例的终端提供者
-                val provider = getTerminalProvider()
+        try {
+            Log.d(TAG, "Starting session: $sessionId")
+            val activeProvider = getTerminalProvider()
+            provider = activeProvider
 
-                // 启动终端会话
-                val result = provider.startSession(sessionId)
-                val (terminalSession, pty) = result.getOrThrow()
-                val sessionWriter = terminalSession.stdin.writer()
+            val result = activeProvider.startSession(sessionId)
+            val (terminalSession, startedPty) = result.getOrThrow()
+            pty = startedPty
+            sessionWriter = terminalSession.stdin.writer()
 
-                // 启动读取协程
-                val readJob = launch {
+            val startedReadJob =
+                coroutineScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                     var reachedEof = false
                     try {
                         terminalSession.stdout.use { inputStream ->
@@ -453,7 +759,10 @@ class TerminalManager private constructor(
                             var bytesRead: Int
                             while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                                 val chunk = String(buffer, 0, bytesRead)
-                                Log.d(TAG, "Read chunk: '$chunk'")
+                                Log.d(
+                                    TAG,
+                                    "Read terminal chunk: sessionId=$sessionId bytes=$bytesRead"
+                                )
                                 outputProcessor.processOutput(sessionId, chunk, sessionManager)
                             }
                             reachedEof = true
@@ -463,7 +772,7 @@ class TerminalManager private constructor(
                     } catch (e: Exception) {
                         Log.e(TAG, "Error in read job for session $sessionId", e)
                     } finally {
-                        if (closingSessions.remove(sessionId)) {
+                        if (closingSessions.contains(sessionId)) {
                             return@launch
                         }
                         if (reachedEof || !terminalSession.process.isAlive) {
@@ -471,26 +780,85 @@ class TerminalManager private constructor(
                         }
                     }
                 }
+            readJob = startedReadJob
 
-                // 更新会话信息
-                sessionManager.updateSession(sessionId) { session ->
-                    session.copy(
-                        terminalSession = terminalSession,
-                        pty = pty,
-                        sessionWriter = sessionWriter,
-                        readJob = readJob
-                    )
+            attachedToState =
+                sessionLifecycleMutex.withLock {
+                    if (closingSessions.contains(sessionId) ||
+                        sessionManager.getSession(sessionId) == null) {
+                        false
+                    } else {
+                        sessionManager.updateSession(sessionId) { session ->
+                            session.copy(
+                                terminalSession = terminalSession,
+                                pty = startedPty,
+                                sessionWriter = sessionWriter,
+                                readJob = startedReadJob
+                            )
+                        }
+                        true
+                    }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error starting session", e)
+
+            if (attachedToState) {
+                startedReadJob.start()
+            } else {
+                closeUnattachedSessionResources(
+                    sessionId = sessionId,
+                    provider = provider,
+                    pty = startedPty,
+                    sessionWriter = sessionWriter,
+                    readJob = startedReadJob
+                )
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting session $sessionId", e)
+            if (!attachedToState) {
+                closeUnattachedSessionResources(
+                    sessionId = sessionId,
+                    provider = provider,
+                    pty = pty,
+                    sessionWriter = sessionWriter,
+                    readJob = readJob
+                )
             }
         }
     }
 
-    private fun handleTerminalSessionExit(sessionId: String, terminalSession: TerminalSession) {
-        if (sessionManager.getSession(sessionId) == null) {
-            return
+    private suspend fun closeUnattachedSessionResources(
+        sessionId: String,
+        provider: TerminalProvider?,
+        pty: Pty?,
+        sessionWriter: java.io.OutputStreamWriter?,
+        readJob: Job?
+    ) = withContext(Dispatchers.IO + NonCancellable) {
+        try {
+            sessionWriter?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close unattached session writer: $sessionId", e)
         }
+        try {
+            provider?.closeSession(sessionId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close unattached provider session: $sessionId", e)
+        }
+        try {
+            pty?.destroy()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close unattached PTY: $sessionId", e)
+        }
+        try {
+            readJob?.cancelAndJoin()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to close unattached read job: $sessionId", e)
+        }
+    }
+
+    private suspend fun handleTerminalSessionExit(
+        sessionId: String,
+        terminalSession: TerminalSession
+    ) {
+        val session = sessionManager.getSession(sessionId) ?: return
 
         val exitCode =
             if (terminalSession.process.isAlive) {
@@ -504,11 +872,14 @@ class TerminalManager private constructor(
             }
 
         Log.i(TAG, "Terminal session $sessionId exited with code $exitCode")
-        outputProcessor.handleSessionExit(
-            sessionId = sessionId,
-            message = context.getString(R.string.terminal_exited_with_code, exitCode),
-            sessionManager = sessionManager
-        )
+        session.commandMutex.withLock {
+            if (closingSessions.contains(sessionId)) return@withLock
+            outputProcessor.handleSessionExit(
+                sessionId = sessionId,
+                message = context.getString(R.string.terminal_exited_with_code, exitCode),
+                sessionManager = sessionManager
+            )
+        }
     }
     
     /**
@@ -1288,25 +1659,13 @@ $prootBindSetup
         """.trimIndent()
     }
 
-    fun closeTerminalSession(sessionId: String) {
-        closingSessions.add(sessionId)
-        // Delegate to provider to ensure underlying process is killed
-        coroutineScope.launch {
-            try {
-                terminalProvider?.closeSession(sessionId)
-            } catch (e: Exception) {
-                Log.e(TAG, "Error closing session via provider", e)
-            }
-        }
-
-        activeSessions[sessionId]?.let { session ->
-            session.process.destroy()
-            activeSessions.remove(sessionId)
-            Log.d(TAG, "Closed and removed session: $sessionId")
-        }
-    }
-
-    private fun handleRegularCommand(command: String, session: com.ai.assistance.operit.terminal.data.TerminalSessionData, commandId: String) {
+    private fun handleRegularCommand(
+        command: String,
+        session: TerminalSessionData,
+        commandId: String,
+        executionMode: CommandExecutionMode = CommandExecutionMode.RAW,
+        executionToken: String = ""
+    ) {
         session.currentCommandOutput.clear()
         session.currentOutputLineCount = 0
 
@@ -1315,7 +1674,9 @@ $prootBindSetup
             prompt = session.currentDirectory,
             command = command,
             output = "",
-            isExecuting = true
+            isExecuting = true,
+            executionMode = executionMode,
+            executionToken = executionToken
         )
 
         // Set the current executing command reference for efficient access
@@ -1332,51 +1693,30 @@ $prootBindSetup
         }
     }
 
-    fun prepareForMaintenance() {
-        // 释放 provider 连接
-        kotlinx.coroutines.runBlocking {
-            terminalProvider?.disconnect()
-            Log.d(TAG, "Disconnected terminal provider")
-            
-            // 停止SSHD服务器
-            sshdServerManager.stopServer()
-            Log.d(TAG, "Stopped SSHD server")
+    suspend fun prepareForMaintenanceAndWait() {
+        terminalState.value.sessions.map { it.id }.forEach { sessionId ->
+            closeSessionAndWait(sessionId)
         }
+
+        terminalProvider?.disconnect()
+        Log.d(TAG, "Disconnected terminal provider")
+
+        sshdServerManager.stopServer()
+        Log.d(TAG, "Stopped SSHD server")
         terminalProvider = null
-        
-        activeSessions.keys.toList().forEach { sessionId ->
-            closeTerminalSession(sessionId)
-        }
-        sessionManager.cleanup()
         Log.d(TAG, "Prepared terminal manager for maintenance.")
+    }
+
+    fun prepareForMaintenance() {
+        kotlinx.coroutines.runBlocking {
+            prepareForMaintenanceAndWait()
+        }
     }
 
     fun cleanup() {
         prepareForMaintenance()
         coroutineScope.cancel()
         Log.d(TAG, "All active sessions cleaned up.")
-    }
-
-    suspend fun executeHiddenCommand(
-        command: String,
-        executorKey: String = "default",
-        timeoutMs: Long = 120000L
-    ): HiddenExecResult {
-        val initialized = initializeEnvironment()
-        if (!initialized) {
-            return HiddenExecResult(
-                output = "",
-                exitCode = -1,
-                state = HiddenExecResult.State.SHELL_START_FAILED,
-                error = "Terminal environment initialization failed"
-            )
-        }
-
-        return getTerminalProvider().executeHiddenCommand(
-            command = command,
-            executorKey = executorKey,
-            timeoutMs = timeoutMs
-        )
     }
 
     /**

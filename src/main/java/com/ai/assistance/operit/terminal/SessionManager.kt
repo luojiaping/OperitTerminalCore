@@ -1,6 +1,7 @@
 package com.ai.assistance.operit.terminal
 
 import android.util.Log
+import com.ai.assistance.operit.terminal.data.SessionPresentation
 import com.ai.assistance.operit.terminal.data.TerminalSessionData
 import com.ai.assistance.operit.terminal.data.TerminalState
 import com.ai.assistance.operit.terminal.provider.type.TerminalType
@@ -11,9 +12,9 @@ import kotlinx.coroutines.flow.update
 
 /**
  * 终端会话管理器
- * 负责管理多个终端会话的生命周期
+ * 负责管理多个终端会话的可观察状态
  */
-class SessionManager(private val terminalManager: TerminalManager) {
+class SessionManager {
     
     private val _state = MutableStateFlow(TerminalState())
     val state: StateFlow<TerminalState> = _state.asStateFlow()
@@ -23,10 +24,12 @@ class SessionManager(private val terminalManager: TerminalManager) {
      * 
      * @param title 会话标题
      * @param terminalType 终端类型
+     * @param presentation 会话是否展示为终端标签页
      */
     fun createNewSession(
         title: String? = null,
-        terminalType: TerminalType
+        terminalType: TerminalType,
+        presentation: SessionPresentation = SessionPresentation.TAB
     ): TerminalSessionData {
         lateinit var newSession: TerminalSessionData
         _state.update { currentState ->
@@ -38,11 +41,17 @@ class SessionManager(private val terminalManager: TerminalManager) {
             }
             newSession = TerminalSessionData(
                 title = title ?: defaultTitle,
-                terminalType = terminalType
+                terminalType = terminalType,
+                presentation = presentation
             )
             currentState.copy(
                 sessions = currentState.sessions + newSession,
-                currentSessionId = newSession.id
+                currentSessionId =
+                    if (presentation == SessionPresentation.TAB) {
+                        newSession.id
+                    } else {
+                        currentState.currentSessionId
+                    }
             )
         }
         
@@ -56,7 +65,9 @@ class SessionManager(private val terminalManager: TerminalManager) {
     fun switchToSession(sessionId: String): Boolean {
         var switched = false
         _state.update { currentState ->
-            if (currentState.sessions.any { it.id == sessionId }) {
+            if (currentState.sessions.any {
+                    it.id == sessionId && it.presentation == SessionPresentation.TAB
+                }) {
                 switched = true
                 currentState.copy(currentSessionId = sessionId)
             } else {
@@ -71,27 +82,18 @@ class SessionManager(private val terminalManager: TerminalManager) {
         return switched
     }
     
-    /**
-     * 关闭会话
-     */
-    fun closeSession(sessionId: String) {
+    internal fun detachSession(sessionId: String): TerminalSessionData? {
+        var detachedSession: TerminalSessionData? = null
         _state.update { currentState ->
             val sessionToClose = currentState.sessions.find { it.id == sessionId }
-            
-            sessionToClose?.let { session ->
-                try {
-                    // 清理资源
-                    session.readJob?.cancel()
-                    session.sessionWriter?.close()
-                    terminalManager.closeTerminalSession(session.id)
-                } catch (e: Exception) {
-                    Log.e("SessionManager", "Error cleaning up session", e)
-                }
-            }
-            
+            if (sessionToClose == null) return@update currentState
+
+            detachedSession = sessionToClose
             val updatedSessions = currentState.sessions.filter { it.id != sessionId }
             val newCurrentSessionId = if (currentState.currentSessionId == sessionId) {
-                updatedSessions.firstOrNull()?.id
+                updatedSessions.firstOrNull {
+                    it.presentation == SessionPresentation.TAB
+                }?.id
             } else {
                 currentState.currentSessionId
             }
@@ -102,9 +104,10 @@ class SessionManager(private val terminalManager: TerminalManager) {
             )
         }
 
-        terminalManager.onSessionClosed(sessionId)
-        
-        Log.d("SessionManager", "Closed session: $sessionId")
+        if (detachedSession != null) {
+            Log.d("SessionManager", "Detached session: $sessionId")
+        }
+        return detachedSession
     }
     
     /**
@@ -153,34 +156,4 @@ class SessionManager(private val terminalManager: TerminalManager) {
         return _state.value.sessions.find { it.id == sessionId }
     }
     
-    /**
-     * 清理会话资源
-     */
-     /*
-    private fun cleanupSession(session: TerminalSessionData) {
-        // 首先取消读取协程
-        session.readJob?.cancel()
-        
-        // 然后关闭流和进程
-        session.sessionWriter?.close()
-        session.terminalSession?.process?.destroy()
-    }
-    */
-    
-    /**
-     * 清理所有会话
-     */
-    fun cleanup() {
-        val currentState = _state.value
-        currentState.sessions.forEach { session ->
-            try {
-                closeSession(session.id)
-            } catch (e: Exception) {
-                Log.e("SessionManager", "Error cleaning up session ${session.id}", e)
-            }
-        }
-        
-        _state.value = TerminalState()
-        Log.d("SessionManager", "All sessions cleaned up")
-    }
-} 
+}
